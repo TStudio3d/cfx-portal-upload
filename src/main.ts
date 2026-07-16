@@ -131,6 +131,18 @@ export async function run(): Promise<void> {
         await deleteVersionWaitingForEscrow(assetId, v.id, cookies)
       }
     }
+
+    const discordWebhook = core.getInput('discordWebhook')
+    if (discordWebhook) {
+      await notifyDiscordOnLive(
+        assetId,
+        uploadedVersionId,
+        version,
+        cookies,
+        discordWebhook,
+        parseInt(core.getInput('escrowTimeout'), 10) || 900
+      )
+    }
   } catch (error) {
     if (axios.isAxiosError(error)) {
       type ErrorData = {
@@ -204,6 +216,79 @@ async function deleteVersionWaitingForEscrow(
       )
       await new Promise(resolve => setTimeout(resolve, delayMs))
     }
+  }
+}
+
+/**
+ * Waits for the just-uploaded version to clear escrow (go live) and posts a
+ * message to a Discord webhook. Best-effort: any failure (poll timeout, webhook
+ * error) is logged as a warning and never fails the release, since the upload
+ * itself has already succeeded.
+ *
+ * "Live" is detected without hard-coding portal state strings: an already-kept
+ * older version is, by definition, out of escrow, so we wait until the uploaded
+ * version's `state` matches that newest reference version's state.
+ * @param assetId
+ * @param uploadedVersionId
+ * @param version
+ * @param cookies
+ * @param webhook Discord webhook URL (base URL, without the /github suffix)
+ * @param timeoutSeconds max seconds to wait for escrow to clear
+ */
+async function notifyDiscordOnLive(
+  assetId: string,
+  uploadedVersionId: number,
+  version: string,
+  cookies: string,
+  webhook: string,
+  timeoutSeconds: number
+): Promise<void> {
+  try {
+    const repo = process.env.GITHUB_REPOSITORY || ''
+    const name = repo.split('/').pop() || `asset ${assetId}`
+    const delayMs = 15000
+    const deadline = Date.now() + Math.max(0, timeoutSeconds) * 1000
+    let live = false
+
+    core.info('Waiting for the new version to clear escrow (Discord notify) ...')
+    for (;;) {
+      const versions = await getAssetVersions(assetId, cookies)
+      const mine = versions.find(v => v.id === uploadedVersionId)
+      const reference = versions
+        .filter(v => v.id !== uploadedVersionId)
+        .sort(
+          (a, b) =>
+            new Date(b.created_at).getTime() - new Date(a.created_at).getTime()
+        )[0]
+
+      core.info(
+        `Escrow poll: uploaded state="${mine?.state ?? 'n/a'}", ` +
+          `reference live state="${reference?.state ?? 'n/a'}"`
+      )
+
+      if (mine && reference && mine.state === reference.state) {
+        live = true
+        break
+      }
+      if (Date.now() >= deadline) break
+      await new Promise(resolve => setTimeout(resolve, delayMs))
+    }
+
+    const content = live
+      ? `🟢 **${name}** v${version} is now live on the CFX portal (asset ${assetId}).`
+      : `⏳ **${name}** v${version} uploaded to CFX — escrow still processing ` +
+        `(not confirmed live within ${timeoutSeconds}s, asset ${assetId}).`
+
+    await axios.post(webhook, { content })
+    core.info(
+      live
+        ? 'Discord: notified that the version is live.'
+        : 'Discord: notified that escrow is still processing.'
+    )
+  } catch (error) {
+    core.warning(
+      `Discord notification skipped (non-fatal): ${error instanceof Error ? error.message : String(error)}`
+    )
   }
 }
 

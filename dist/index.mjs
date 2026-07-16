@@ -19750,10 +19750,10 @@ Support boolean input list: \`true | True | TRUE | false | False | FALSE\``);
       (0, command_1.issueCommand)("error", (0, utils_1.toCommandProperties)(properties), message instanceof Error ? message.toString() : message);
     }
     exports.error = error2;
-    function warning2(message, properties = {}) {
+    function warning3(message, properties = {}) {
       (0, command_1.issueCommand)("warning", (0, utils_1.toCommandProperties)(properties), message instanceof Error ? message.toString() : message);
     }
-    exports.warning = warning2;
+    exports.warning = warning3;
     function notice(message, properties = {}) {
       (0, command_1.issueCommand)("notice", (0, utils_1.toCommandProperties)(properties), message instanceof Error ? message.toString() : message);
     }
@@ -97418,7 +97418,7 @@ var init_esm = __esm({
       process: {
         argv: () => process.argv,
         cwd: process.cwd,
-        emitWarning: (warning2, type) => process.emitWarning(warning2, type),
+        emitWarning: (warning3, type) => process.emitWarning(warning3, type),
         execPath: () => process.execPath,
         exit: process.exit,
         nextTick: process.nextTick,
@@ -100302,9 +100302,9 @@ var init_yargs_factory = __esm({
         });
         delete __classPrivateFieldGet2(this, _YargsInstance_usage, "f").getDescriptions()[optionKey];
       }
-      [kEmitWarning](warning2, type, deduplicationId) {
+      [kEmitWarning](warning3, type, deduplicationId) {
         if (!__classPrivateFieldGet2(this, _YargsInstance_emittedWarnings, "f")[deduplicationId]) {
-          __classPrivateFieldGet2(this, _YargsInstance_shim, "f").process.emitWarning(warning2, type);
+          __classPrivateFieldGet2(this, _YargsInstance_shim, "f").process.emitWarning(warning3, type);
           __classPrivateFieldGet2(this, _YargsInstance_emittedWarnings, "f")[deduplicationId] = true;
         }
       }
@@ -119263,6 +119263,17 @@ async function run() {
         await deleteVersionWaitingForEscrow(assetId, v2.id, cookies);
       }
     }
+    const discordWebhook = core2.getInput("discordWebhook");
+    if (discordWebhook) {
+      await notifyDiscordOnLive(
+        assetId,
+        uploadedVersionId,
+        version,
+        cookies,
+        discordWebhook,
+        parseInt(core2.getInput("escrowTimeout"), 10) || 900
+      );
+    }
   } catch (error2) {
     if (axios_default.isAxiosError(error2)) {
       const status = error2.response?.status;
@@ -119300,6 +119311,41 @@ async function deleteVersionWaitingForEscrow(assetId, versionId, cookies) {
       );
       await new Promise((resolve7) => setTimeout(resolve7, delayMs));
     }
+  }
+}
+async function notifyDiscordOnLive(assetId, uploadedVersionId, version, cookies, webhook, timeoutSeconds) {
+  try {
+    const repo = process.env.GITHUB_REPOSITORY || "";
+    const name = repo.split("/").pop() || `asset ${assetId}`;
+    const delayMs = 15e3;
+    const deadline = Date.now() + Math.max(0, timeoutSeconds) * 1e3;
+    let live = false;
+    core2.info("Waiting for the new version to clear escrow (Discord notify) ...");
+    for (; ; ) {
+      const versions = await getAssetVersions(assetId, cookies);
+      const mine = versions.find((v2) => v2.id === uploadedVersionId);
+      const reference = versions.filter((v2) => v2.id !== uploadedVersionId).sort(
+        (a2, b3) => new Date(b3.created_at).getTime() - new Date(a2.created_at).getTime()
+      )[0];
+      core2.info(
+        `Escrow poll: uploaded state="${mine?.state ?? "n/a"}", reference live state="${reference?.state ?? "n/a"}"`
+      );
+      if (mine && reference && mine.state === reference.state) {
+        live = true;
+        break;
+      }
+      if (Date.now() >= deadline) break;
+      await new Promise((resolve7) => setTimeout(resolve7, delayMs));
+    }
+    const content = live ? `\u{1F7E2} **${name}** v${version} is now live on the CFX portal (asset ${assetId}).` : `\u23F3 **${name}** v${version} uploaded to CFX \u2014 escrow still processing (not confirmed live within ${timeoutSeconds}s, asset ${assetId}).`;
+    await axios_default.post(webhook, { content });
+    core2.info(
+      live ? "Discord: notified that the version is live." : "Discord: notified that escrow is still processing."
+    );
+  } catch (error2) {
+    core2.warning(
+      `Discord notification skipped (non-fatal): ${error2 instanceof Error ? error2.message : String(error2)}`
+    );
   }
 }
 async function loginToPortal(browser, page, maxRetries) {

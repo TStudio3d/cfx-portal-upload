@@ -55,6 +55,19 @@ inputs:
     description: 'The chunk size to split the file into'
     required: false
     default: 2097152
+  discordWebhook:
+    description:
+      'Optional Discord webhook URL. When set, the action waits for the uploaded
+      version to clear escrow (go live) and posts a message to Discord — or a
+      "still processing" notice if it does not go live within escrowTimeout.'
+    required: false
+  escrowTimeout:
+    description:
+      'Max seconds to wait for the uploaded version to leave escrow before
+      sending the "still processing" Discord notice (only used with
+      discordWebhook).'
+    required: false
+    default: 900
 
 runs:
   using: node24
