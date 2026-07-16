@@ -45,8 +45,7 @@ inputs:
     description:
       'How many newest versions to keep when deleteOlderVersions is true
       (includes the just-uploaded one). Older versions are pruned once the new
-      upload clears escrow. Default 2 keeps one previous version as a rollback
-      margin.'
+      upload clears escrow. Defaults to 1 (keep only the newest, the prior behaviour); increase to retain rollback versions.'
     required: false
     default: 1
   skipUpload:
