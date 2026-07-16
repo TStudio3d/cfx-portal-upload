@@ -119251,11 +119251,16 @@ async function run() {
     );
     if (deleteOlderVersions) {
       core2.info("Deleting older versions ...");
+      const keepVersions = Math.max(
+        1,
+        parseInt(core2.getInput("keepVersions"), 10) || 1
+      );
       const versions = await getAssetVersions(assetId, cookies);
-      for (const v2 of versions) {
-        if (v2.id !== uploadedVersionId) {
-          await deleteAssetVersion(assetId, v2.id, cookies);
-        }
+      const prunable = versions.filter((v2) => v2.id !== uploadedVersionId).sort(
+        (a2, b3) => new Date(b3.created_at).getTime() - new Date(a2.created_at).getTime() || b3.id - a2.id
+      ).slice(keepVersions - 1);
+      for (const v2 of prunable) {
+        await deleteVersionWaitingForEscrow(assetId, v2.id, cookies);
       }
     }
   } catch (error2) {
@@ -119275,6 +119280,26 @@ async function run() {
     }
   } finally {
     await browser?.close();
+  }
+}
+async function deleteVersionWaitingForEscrow(assetId, versionId, cookies) {
+  const maxAttempts = 40;
+  const delayMs = 15e3;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await deleteAssetVersion(assetId, versionId, cookies);
+      return;
+    } catch (error2) {
+      const body = axios_default.isAxiosError(error2) ? `${JSON.stringify(error2.response?.data ?? "")} ${error2.message}` : "";
+      const isEscrowGuard = axios_default.isAxiosError(error2) && error2.response?.status === 409 && /last version/i.test(body);
+      if (!isEscrowGuard || attempt === maxAttempts) {
+        throw error2;
+      }
+      core2.info(
+        `New version still in escrow; portal will not drop the last old version yet. Waiting ${delayMs / 1e3}s before retrying delete of version ${versionId} (attempt ${attempt}/${maxAttempts})...`
+      );
+      await new Promise((resolve7) => setTimeout(resolve7, delayMs));
+    }
   }
 }
 async function loginToPortal(browser, page, maxRetries) {

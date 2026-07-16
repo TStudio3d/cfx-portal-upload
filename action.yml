@@ -41,6 +41,14 @@ inputs:
     description: 'Delete older versions of the asset after upload'
     required: false
     default: false
+  keepVersions:
+    description:
+      'How many newest versions to keep when deleteOlderVersions is true
+      (includes the just-uploaded one). Older versions are pruned once the new
+      upload clears escrow. Default 2 keeps one previous version as a rollback
+      margin.'
+    required: false
+    default: 2
   skipUpload:
     description: 'Skip the upload and only go through the login process'
     required: false

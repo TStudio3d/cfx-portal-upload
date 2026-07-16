@@ -108,11 +108,27 @@ export async function run(): Promise<void> {
 
     if (deleteOlderVersions) {
       core.info('Deleting older versions ...')
+
+      // Keep the just-uploaded version plus the newest (keepVersions - 1) other
+      // versions as a rollback margin; prune everything older. Default 1 keeps
+      // only the newest version (original behaviour).
+      const keepVersions = Math.max(
+        1,
+        parseInt(core.getInput('keepVersions'), 10) || 1
+      )
+
       const versions = await getAssetVersions(assetId, cookies)
-      for (const v of versions) {
-        if (v.id !== uploadedVersionId) {
-          await deleteAssetVersion(assetId, v.id, cookies)
-        }
+      const prunable = versions
+        .filter(v => v.id !== uploadedVersionId)
+        .sort(
+          (a, b) =>
+            new Date(b.created_at).getTime() -
+              new Date(a.created_at).getTime() || b.id - a.id
+        )
+        .slice(keepVersions - 1)
+
+      for (const v of prunable) {
+        await deleteVersionWaitingForEscrow(assetId, v.id, cookies)
       }
     }
   } catch (error) {
@@ -139,6 +155,55 @@ export async function run(): Promise<void> {
     }
   } finally {
     await browser?.close()
+  }
+}
+
+/**
+ * Deletes an asset version, tolerating the portal's escrow race.
+ *
+ * Immediately after upload the new version is still processing in escrow and does
+ * not yet count towards the portal's "an asset must keep at least one version"
+ * rule. Deleting the previous last version therefore fails with
+ * 409 "cannot delete last version". That state is transient: once escrow
+ * releases, the new version counts and the delete succeeds. We retry only that
+ * specific 409 (waiting for escrow to finish); every other error is surfaced
+ * immediately so genuine failures still fail the build.
+ * @param assetId
+ * @param versionId
+ * @param cookies
+ */
+async function deleteVersionWaitingForEscrow(
+  assetId: string,
+  versionId: number,
+  cookies: string
+): Promise<void> {
+  const maxAttempts = 40
+  const delayMs = 15000
+
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await deleteAssetVersion(assetId, versionId, cookies)
+      return
+    } catch (error) {
+      const body = axios.isAxiosError(error)
+        ? `${JSON.stringify(error.response?.data ?? '')} ${error.message}`
+        : ''
+      const isEscrowGuard =
+        axios.isAxiosError(error) &&
+        error.response?.status === 409 &&
+        /last version/i.test(body)
+
+      if (!isEscrowGuard || attempt === maxAttempts) {
+        throw error
+      }
+
+      core.info(
+        `New version still in escrow; portal will not drop the last old version yet. ` +
+          `Waiting ${delayMs / 1000}s before retrying delete of version ${versionId} ` +
+          `(attempt ${attempt}/${maxAttempts})...`
+      )
+      await new Promise(resolve => setTimeout(resolve, delayMs))
+    }
   }
 }
 
