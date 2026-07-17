@@ -119271,7 +119271,8 @@ async function run() {
         version,
         cookies,
         discordWebhook,
-        parseInt(core2.getInput("escrowTimeout"), 10) || 900
+        parseInt(core2.getInput("escrowTimeout"), 10) || 900,
+        changelog
       );
     }
   } catch (error2) {
@@ -119313,7 +119314,7 @@ async function deleteVersionWaitingForEscrow(assetId, versionId, cookies) {
     }
   }
 }
-async function notifyDiscordOnLive(assetId, uploadedVersionId, version, cookies, webhook, timeoutSeconds) {
+async function notifyDiscordOnLive(assetId, uploadedVersionId, version, cookies, webhook, timeoutSeconds, changelog) {
   try {
     const repo = process.env.GITHUB_REPOSITORY || "";
     const name = repo.split("/").pop() || `asset ${assetId}`;
@@ -119337,8 +119338,33 @@ async function notifyDiscordOnLive(assetId, uploadedVersionId, version, cookies,
       if (Date.now() >= deadline) break;
       await new Promise((resolve7) => setTimeout(resolve7, delayMs));
     }
-    const content = live ? `\u{1F7E2} **${name}** v${version} is now live on the CFX portal (asset ${assetId}).` : `\u23F3 **${name}** v${version} uploaded to CFX \u2014 escrow still processing (not confirmed live within ${timeoutSeconds}s, asset ${assetId}).`;
-    await axios_default.post(webhook, { content });
+    const status = live ? "This version is now live on the Cfx.re portal." : `Uploaded to the Cfx.re portal \u2014 still clearing escrow (not confirmed live within ${timeoutSeconds}s).`;
+    const notes = (changelog ?? "").trim();
+    let description = notes ? `${status}
+
+${notes}` : status;
+    if (description.length > 4e3) description = `${description.slice(0, 4e3)}
+\u2026`;
+    const serverUrl = process.env.GITHUB_SERVER_URL || "https://github.com";
+    const tag = process.env.GITHUB_REF_NAME || "";
+    const embed = {
+      title: `${name} v${version}`.slice(0, 256),
+      description,
+      color: live ? 5763719 : 16705372,
+      fields: [
+        {
+          name: "Status",
+          value: live ? "\u{1F7E2} Live" : "\u23F3 Escrow processing",
+          inline: true
+        },
+        { name: "Version", value: `v${version}`, inline: true },
+        { name: "Asset", value: `\`${assetId}\``, inline: true }
+      ],
+      footer: { text: repo || `asset ${assetId}` },
+      timestamp: (/* @__PURE__ */ new Date()).toISOString()
+    };
+    if (repo && tag) embed.url = `${serverUrl}/${repo}/releases/tag/${tag}`;
+    await axios_default.post(webhook, { embeds: [embed] });
     core2.info(
       live ? "Discord: notified that the version is live." : "Discord: notified that escrow is still processing."
     );

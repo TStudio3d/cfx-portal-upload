@@ -140,7 +140,8 @@ export async function run(): Promise<void> {
         version,
         cookies,
         discordWebhook,
-        parseInt(core.getInput('escrowTimeout'), 10) || 900
+        parseInt(core.getInput('escrowTimeout'), 10) || 900,
+        changelog
       )
     }
   } catch (error) {
@@ -234,6 +235,7 @@ async function deleteVersionWaitingForEscrow(
  * @param cookies
  * @param webhook Discord webhook URL (base URL, without the /github suffix)
  * @param timeoutSeconds max seconds to wait for escrow to clear
+ * @param changelog release notes to show in the embed body, if any
  */
 async function notifyDiscordOnLive(
   assetId: string,
@@ -241,7 +243,8 @@ async function notifyDiscordOnLive(
   version: string,
   cookies: string,
   webhook: string,
-  timeoutSeconds: number
+  timeoutSeconds: number,
+  changelog?: string
 ): Promise<void> {
   try {
     const repo = process.env.GITHUB_REPOSITORY || ''
@@ -274,12 +277,38 @@ async function notifyDiscordOnLive(
       await new Promise(resolve => setTimeout(resolve, delayMs))
     }
 
-    const content = live
-      ? `🟢 **${name}** v${version} is now live on the CFX portal (asset ${assetId}).`
-      : `⏳ **${name}** v${version} uploaded to CFX — escrow still processing ` +
-        `(not confirmed live within ${timeoutSeconds}s, asset ${assetId}).`
+    const status = live
+      ? 'This version is now live on the Cfx.re portal.'
+      : `Uploaded to the Cfx.re portal — still clearing escrow ` +
+        `(not confirmed live within ${timeoutSeconds}s).`
 
-    await axios.post(webhook, { content })
+    // Discord embed limits: title 256, description 4096, field value 1024.
+    const notes = (changelog ?? '').trim()
+    let description = notes ? `${status}\n\n${notes}` : status
+    if (description.length > 4000) description = `${description.slice(0, 4000)}\n…`
+
+    const serverUrl = process.env.GITHUB_SERVER_URL || 'https://github.com'
+    const tag = process.env.GITHUB_REF_NAME || ''
+
+    const embed: Record<string, unknown> = {
+      title: `${name} v${version}`.slice(0, 256),
+      description,
+      color: live ? 0x57f287 : 0xfee75c,
+      fields: [
+        {
+          name: 'Status',
+          value: live ? '🟢 Live' : '⏳ Escrow processing',
+          inline: true
+        },
+        { name: 'Version', value: `v${version}`, inline: true },
+        { name: 'Asset', value: `\`${assetId}\``, inline: true }
+      ],
+      footer: { text: repo || `asset ${assetId}` },
+      timestamp: new Date().toISOString()
+    }
+    if (repo && tag) embed.url = `${serverUrl}/${repo}/releases/tag/${tag}`
+
+    await axios.post(webhook, { embeds: [embed] })
     core.info(
       live
         ? 'Discord: notified that the version is live.'
