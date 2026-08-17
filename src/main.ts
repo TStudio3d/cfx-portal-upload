@@ -107,6 +107,28 @@ export async function run(): Promise<void> {
       maxRetries
     )
 
+    const discordWebhook = core.getInput('discordWebhook')
+    const escrowTimeout = parseInt(core.getInput('escrowTimeout'), 10) || 900
+
+    // Escrow settles BEFORE anything is pruned. Pruning deletes the settled
+    // versions that waitForLive uses as its out-of-escrow reference, so doing it
+    // first makes the liveness check compare the new version against another
+    // equally-unsettled one and report live immediately — see waitForLive.
+    //
+    // Waiting first is also what makes the prune cheap: the portal refuses to
+    // drop the last settled version while the new one is still in escrow, which
+    // is the whole reason deleteVersionWaitingForEscrow has to retry a 409. By
+    // this point that guard is a safety net rather than the normal path.
+    let live = false
+    if (deleteOlderVersions || discordWebhook) {
+      live = await waitForLive(
+        assetId,
+        uploadedVersionId,
+        cookies,
+        escrowTimeout
+      )
+    }
+
     if (deleteOlderVersions) {
       core.info('Deleting older versions ...')
 
@@ -133,15 +155,13 @@ export async function run(): Promise<void> {
       }
     }
 
-    const discordWebhook = core.getInput('discordWebhook')
     if (discordWebhook) {
-      await notifyDiscordOnLive(
+      await notifyDiscord(
         assetId,
-        uploadedVersionId,
         version,
-        cookies,
+        live,
         discordWebhook,
-        parseInt(core.getInput('escrowTimeout'), 10) || 900,
+        escrowTimeout,
         changelog
       )
     }
@@ -222,41 +242,37 @@ async function deleteVersionWaitingForEscrow(
 }
 
 /**
- * Waits for the just-uploaded version to clear escrow (go live) and posts a
- * message to a Discord webhook. Best-effort: any failure (poll timeout, webhook
- * error) is logged as a warning and never fails the release, since the upload
- * itself has already succeeded.
+ * Waits for the just-uploaded version to clear escrow (go live).
  *
- * "Live" is detected without hard-coding portal state strings: an already-kept
- * older version is, by definition, out of escrow, so we wait until the uploaded
- * version's `state` matches that newest reference version's state.
+ * "Live" is detected without hard-coding portal state strings: a version that
+ * was already on the asset before this upload is, by definition, out of escrow,
+ * so the new version is live once its `state` matches that reference version's.
+ *
+ * **This must run before any pruning.** `deleteOlderVersions` removes precisely
+ * the settled versions the comparison depends on. Prune first and the newest
+ * remaining "reference" is another freshly-created version, as unsettled as the
+ * one being measured — the states match on the very first poll and the caller
+ * is told the upload is live seconds after the last chunk. Measured on
+ * tstudio_cveh_police_1: v1.0.19 (no pruning) polled 17 times across ~4 minutes
+ * and waited for `active`; v1.0.21 (pruning first) polled once and reported
+ * live immediately. Nothing about the upload was wrong — only the report.
  * @param assetId
  * @param uploadedVersionId
- * @param version
  * @param cookies
- * @param webhook Discord webhook URL (base URL, without the /github suffix)
  * @param timeoutSeconds max seconds to wait for escrow to clear
- * @param changelog release notes to show in the embed body, if any
+ * @returns Whether escrow was confirmed cleared within the timeout.
  */
-async function notifyDiscordOnLive(
+async function waitForLive(
   assetId: string,
   uploadedVersionId: number,
-  version: string,
   cookies: string,
-  webhook: string,
-  timeoutSeconds: number,
-  changelog?: string
-): Promise<void> {
+  timeoutSeconds: number
+): Promise<boolean> {
   try {
-    const repo = process.env.GITHUB_REPOSITORY || ''
-    const name = repo.split('/').pop() || `asset ${assetId}`
     const delayMs = 15000
     const deadline = Date.now() + Math.max(0, timeoutSeconds) * 1000
-    let live = false
 
-    core.info(
-      'Waiting for the new version to clear escrow (Discord notify) ...'
-    )
+    core.info('Waiting for the new version to clear escrow ...')
     for (;;) {
       const versions = await getAssetVersions(assetId, cookies)
       const mine = versions.find(v => v.id === uploadedVersionId)
@@ -272,13 +288,41 @@ async function notifyDiscordOnLive(
           `reference live state="${reference?.state ?? 'n/a'}"`
       )
 
-      if (mine && reference && mine.state === reference.state) {
-        live = true
-        break
-      }
-      if (Date.now() >= deadline) break
+      if (mine && reference && mine.state === reference.state) return true
+      if (Date.now() >= deadline) return false
       await new Promise(resolve => setTimeout(resolve, delayMs))
     }
+  } catch (error) {
+    // The upload has already succeeded by here, so a polling failure must not
+    // fail the release — it only costs us the certainty of the Discord label.
+    core.warning(
+      `Escrow wait skipped (non-fatal): ${error instanceof Error ? error.message : String(error)}`
+    )
+    return false
+  }
+}
+
+/**
+ * Posts the upload result to a Discord webhook. Best-effort: any failure is
+ * logged as a warning and never fails the release.
+ * @param assetId
+ * @param version
+ * @param live Whether escrow was confirmed cleared by waitForLive.
+ * @param webhook Discord webhook URL (base URL, without the /github suffix)
+ * @param timeoutSeconds the escrow budget, quoted when it was not confirmed
+ * @param changelog release notes to show in the embed body, if any
+ */
+async function notifyDiscord(
+  assetId: string,
+  version: string,
+  live: boolean,
+  webhook: string,
+  timeoutSeconds: number,
+  changelog?: string
+): Promise<void> {
+  try {
+    const repo = process.env.GITHUB_REPOSITORY || ''
+    const name = repo.split('/').pop() || `asset ${assetId}`
 
     const status = live
       ? 'This version is now live on the Cfx.re portal.'

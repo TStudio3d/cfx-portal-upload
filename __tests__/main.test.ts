@@ -252,6 +252,11 @@ describe('main', () => {
           return '1024'
         case 'maxRetries':
           return maxRetries
+        // Keep these tests about chunk retries alone: an empty webhook skips
+        // the escrow wait and the Discord post, so axios.post counts only
+        // upload traffic.
+        case 'discordWebhook':
+          return ''
         default:
           return 'false'
       }
@@ -327,6 +332,70 @@ describe('main', () => {
       expect.stringContaining('Retrying in')
     )
     expect(core.setFailed).toHaveBeenCalled()
+  })
+
+  // Pruning deletes the settled versions the liveness check uses as its
+  // reference, so it has to happen AFTER escrow is confirmed. Getting this
+  // backwards does not break the upload — it makes the Discord notice claim the
+  // version is live seconds after the last chunk. Ordering is the whole fix.
+  it('should wait for escrow before pruning older versions', async () => {
+    const order: string[] = []
+    ;(core.getInput as jest.Mock).mockImplementation((name: string) => {
+      switch (name) {
+        case 'assetId':
+          return '123'
+        case 'zipPath':
+          return 'test.zip'
+        case 'cookie':
+          return 'test-cookie'
+        case 'chunkSize':
+          return '1024'
+        case 'maxRetries':
+          return '1'
+        case 'deleteOlderVersions':
+          return 'true'
+        case 'keepVersions':
+          return '1'
+        default:
+          return ''
+      }
+    })
+
+    pageMock.evaluate.mockResolvedValueOnce({ url: 'https://forum-redirect' })
+    pageMock.url.mockReturnValue('https://portal.cfx.re')
+    ;(utils.getFxManifestVersion as jest.Mock).mockReturnValue('1.0.0')
+    ;(utils.getChangelog as jest.Mock).mockReturnValue('test changelog')
+    ;(axios.post as jest.Mock).mockResolvedValue({
+      data: { asset_id: 123, version_id: 456, errors: null }
+    })
+    ;(core.info as jest.Mock).mockImplementation((message: unknown) => {
+      if (
+        typeof message === 'string' &&
+        message.startsWith('Waiting for the new version')
+      ) {
+        order.push('escrow-wait')
+      }
+    })
+    // Uploaded version already matches the settled reference, so the poll
+    // resolves on its first pass and the test needs no timer control.
+    ;(utils.getAssetVersions as jest.Mock).mockResolvedValue([
+      { id: 456, version: '1.0.0', state: 'active', created_at: '2026-01-02' },
+      { id: 111, version: '0.9.0', state: 'active', created_at: '2026-01-01' }
+    ])
+    ;(utils.deleteAssetVersion as jest.Mock).mockImplementation(async () => {
+      order.push('prune')
+      await Promise.resolve()
+    })
+
+    await main.run()
+
+    expect(order[0]).toBe('escrow-wait')
+    expect(order).toContain('prune')
+    expect(utils.deleteAssetVersion as jest.Mock).toHaveBeenCalledWith(
+      '123',
+      111,
+      expect.anything()
+    )
   })
 
   it('should resolve assetId from assetName if assetId is not provided', async () => {

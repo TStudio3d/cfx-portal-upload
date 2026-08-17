@@ -119250,6 +119250,17 @@ async function run() {
       changelog,
       maxRetries
     );
+    const discordWebhook = core2.getInput("discordWebhook");
+    const escrowTimeout = parseInt(core2.getInput("escrowTimeout"), 10) || 900;
+    let live = false;
+    if (deleteOlderVersions || discordWebhook) {
+      live = await waitForLive(
+        assetId,
+        uploadedVersionId,
+        cookies,
+        escrowTimeout
+      );
+    }
     if (deleteOlderVersions) {
       core2.info("Deleting older versions ...");
       const keepVersions = Math.max(
@@ -119264,15 +119275,13 @@ async function run() {
         await deleteVersionWaitingForEscrow(assetId, v2.id, cookies);
       }
     }
-    const discordWebhook = core2.getInput("discordWebhook");
     if (discordWebhook) {
-      await notifyDiscordOnLive(
+      await notifyDiscord(
         assetId,
-        uploadedVersionId,
         version,
-        cookies,
+        live,
         discordWebhook,
-        parseInt(core2.getInput("escrowTimeout"), 10) || 900,
+        escrowTimeout,
         changelog
       );
     }
@@ -119315,16 +119324,11 @@ async function deleteVersionWaitingForEscrow(assetId, versionId, cookies) {
     }
   }
 }
-async function notifyDiscordOnLive(assetId, uploadedVersionId, version, cookies, webhook, timeoutSeconds, changelog) {
+async function waitForLive(assetId, uploadedVersionId, cookies, timeoutSeconds) {
   try {
-    const repo = process.env.GITHUB_REPOSITORY || "";
-    const name = repo.split("/").pop() || `asset ${assetId}`;
     const delayMs = 15e3;
     const deadline = Date.now() + Math.max(0, timeoutSeconds) * 1e3;
-    let live = false;
-    core2.info(
-      "Waiting for the new version to clear escrow (Discord notify) ..."
-    );
+    core2.info("Waiting for the new version to clear escrow ...");
     for (; ; ) {
       const versions = await getAssetVersions(assetId, cookies);
       const mine = versions.find((v2) => v2.id === uploadedVersionId);
@@ -119334,13 +119338,21 @@ async function notifyDiscordOnLive(assetId, uploadedVersionId, version, cookies,
       core2.info(
         `Escrow poll: uploaded state="${mine?.state ?? "n/a"}", reference live state="${reference?.state ?? "n/a"}"`
       );
-      if (mine && reference && mine.state === reference.state) {
-        live = true;
-        break;
-      }
-      if (Date.now() >= deadline) break;
+      if (mine && reference && mine.state === reference.state) return true;
+      if (Date.now() >= deadline) return false;
       await new Promise((resolve7) => setTimeout(resolve7, delayMs));
     }
+  } catch (error2) {
+    core2.warning(
+      `Escrow wait skipped (non-fatal): ${error2 instanceof Error ? error2.message : String(error2)}`
+    );
+    return false;
+  }
+}
+async function notifyDiscord(assetId, version, live, webhook, timeoutSeconds, changelog) {
+  try {
+    const repo = process.env.GITHUB_REPOSITORY || "";
+    const name = repo.split("/").pop() || `asset ${assetId}`;
     const status = live ? "This version is now live on the Cfx.re portal." : `Uploaded to the Cfx.re portal \u2014 still clearing escrow (not confirmed live within ${timeoutSeconds}s).`;
     const notes = (changelog ?? "").trim();
     let description = notes ? `${status}
