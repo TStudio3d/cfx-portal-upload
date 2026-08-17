@@ -236,6 +236,99 @@ describe('main', () => {
     expect(browserMock.close).toHaveBeenCalled()
   })
 
+  // A single flaky chunk used to fail the whole release: tstudio_cveh_police_1
+  // v1.0.20 died on chunk 250 of 305 with a portal 504 after four minutes of
+  // uploading. These two tests pin down which failures are worth another try.
+  function mockSingleChunkUpload(maxRetries: string): void {
+    ;(core.getInput as jest.Mock).mockImplementation((name: string) => {
+      switch (name) {
+        case 'assetId':
+          return '123'
+        case 'zipPath':
+          return 'test.zip'
+        case 'cookie':
+          return 'test-cookie'
+        case 'chunkSize':
+          return '1024'
+        case 'maxRetries':
+          return maxRetries
+        default:
+          return 'false'
+      }
+    })
+
+    pageMock.evaluate.mockResolvedValueOnce({ url: 'https://forum-redirect' })
+    pageMock.url.mockReturnValue('https://portal.cfx.re')
+    ;(utils.getFxManifestVersion as jest.Mock).mockReturnValue('1.0.0')
+    ;(utils.getChangelog as jest.Mock).mockReturnValue('test changelog')
+    ;(axios.isAxiosError as jest.Mock).mockReturnValue(true)
+    ;(fs.statSync as jest.Mock).mockReturnValue({ size: 1024 })
+    ;(fs.createReadStream as jest.Mock).mockReturnValue({
+      [Symbol.asyncIterator]: async function* () {
+        await Promise.resolve()
+        yield Buffer.from('chunk1')
+      }
+    })
+  }
+
+  function portalError(status: number): unknown {
+    return {
+      response: { status, data: { error: 'stream timeout' } },
+      message: `Request failed with status code ${status}`
+    }
+  }
+
+  it('should retry a chunk that fails with a transient portal error', async () => {
+    mockSingleChunkUpload('3')
+    ;(axios.post as jest.Mock)
+      // startReupload
+      .mockResolvedValueOnce({
+        data: { asset_id: 123, version_id: 456, errors: null }
+      })
+      // the chunk: 504 once, then accepted
+      .mockRejectedValueOnce(portalError(504))
+      .mockResolvedValueOnce({ data: {} })
+      // completeUpload
+      .mockResolvedValueOnce({ data: {} })
+
+    jest.useFakeTimers()
+    try {
+      const running = main.run()
+      // First chunk retry backs off 2s.
+      await jest.advanceTimersByTimeAsync(2000)
+      await running
+    } finally {
+      jest.useRealTimers()
+    }
+
+    // startReupload + 2 chunk attempts + completeUpload
+    expect(axios.post as jest.Mock).toHaveBeenCalledTimes(4)
+    expect(core.setFailed).not.toHaveBeenCalled()
+    expect(core.info).toHaveBeenCalledWith('Upload completed.')
+    expect(core.warning).toHaveBeenCalledWith(
+      expect.stringContaining('Chunk 1 failed (504)')
+    )
+  })
+
+  it('should not retry a chunk the portal rejects with a 4xx', async () => {
+    mockSingleChunkUpload('5')
+    ;(axios.post as jest.Mock)
+      .mockResolvedValueOnce({
+        data: { asset_id: 123, version_id: 456, errors: null }
+      })
+      // 403 is the portal refusing the request itself — retrying cannot help.
+      .mockRejectedValueOnce(portalError(403))
+
+    await main.run()
+
+    // startReupload + exactly one chunk attempt, then out. No completeUpload.
+    expect(axios.post as jest.Mock).toHaveBeenCalledTimes(2)
+    expect(core.warning).not.toHaveBeenCalledWith(
+      expect.stringContaining('Retrying in')
+    )
+    expect(core.setFailed).toHaveBeenCalled()
+  })
+
   it('should resolve assetId from assetName if assetId is not provided', async () => {
     ;(core.getInput as jest.Mock).mockImplementation((name: string) => {
       switch (name) {

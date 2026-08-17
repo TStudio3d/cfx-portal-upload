@@ -119247,7 +119247,8 @@ async function run() {
       cookies,
       beta,
       version,
-      changelog
+      changelog,
+      maxRetries
     );
     if (deleteOlderVersions) {
       core2.info("Deleting older versions ...");
@@ -119321,7 +119322,9 @@ async function notifyDiscordOnLive(assetId, uploadedVersionId, version, cookies,
     const delayMs = 15e3;
     const deadline = Date.now() + Math.max(0, timeoutSeconds) * 1e3;
     let live = false;
-    core2.info("Waiting for the new version to clear escrow (Discord notify) ...");
+    core2.info(
+      "Waiting for the new version to clear escrow (Discord notify) ..."
+    );
     for (; ; ) {
       const versions = await getAssetVersions(assetId, cookies);
       const mine = versions.find((v2) => v2.id === uploadedVersionId);
@@ -119343,7 +119346,8 @@ async function notifyDiscordOnLive(assetId, uploadedVersionId, version, cookies,
     let description = notes ? `${status}
 
 ${notes}` : status;
-    if (description.length > 4e3) description = `${description.slice(0, 4e3)}
+    if (description.length > 4e3)
+      description = `${description.slice(0, 4e3)}
 \u2026`;
     const serverUrl = process.env.GITHUB_SERVER_URL || "https://github.com";
     const tag = process.env.GITHUB_REF_NAME || "";
@@ -119494,7 +119498,7 @@ async function startReupload(zipPath, assetId, chunkSize, cookies, beta, version
   }
   return [reUploadResponse.data.asset_id, reUploadResponse.data.version_id];
 }
-async function uploadZip(zipPath, assetId, chunkSize, cookies, beta, version, changelog) {
+async function uploadZip(zipPath, assetId, chunkSize, cookies, beta, version, changelog, maxRetries) {
   const [assetIdReupload, versionId] = await startReupload(
     zipPath,
     assetId,
@@ -119509,28 +119513,62 @@ async function uploadZip(zipPath, assetId, chunkSize, cookies, beta, version, ch
   const totalSize = stats.size;
   const chunkCount = Math.ceil(totalSize / chunkSize);
   const stream4 = createReadStream3(zipPath, { highWaterMark: chunkSize });
+  const chunkUrl = getUrl("UPLOAD_CHUNK", {
+    id: assetIdReupload,
+    version_id: versionId
+  });
   for await (const chunk of stream4) {
-    const form = new import_form_data2.default();
-    form.append("chunk_id", chunkIndex);
-    form.append("chunk", chunk, {
-      filename: "blob",
-      contentType: "application/octet-stream"
-    });
-    await axios_default.post(
-      getUrl("UPLOAD_CHUNK", { id: assetIdReupload, version_id: versionId }),
-      form,
-      {
-        headers: {
-          ...form.getHeaders(),
-          Cookie: cookies
-        }
-      }
+    await postChunkWithRetry(
+      chunkUrl,
+      chunk,
+      chunkIndex,
+      cookies,
+      maxRetries
     );
     core2.info(`Uploaded chunk ${chunkIndex + 1}/${chunkCount}`);
     chunkIndex++;
   }
   await completeUpload(assetIdReupload, versionId, cookies);
   return versionId;
+}
+async function postChunkWithRetry(url2, chunk, chunkId, cookies, maxRetries) {
+  let lastError;
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      const form = new import_form_data2.default();
+      form.append("chunk_id", chunkId);
+      form.append("chunk", chunk, {
+        filename: "blob",
+        contentType: "application/octet-stream"
+      });
+      await axios_default.post(url2, form, {
+        headers: {
+          ...form.getHeaders(),
+          Cookie: cookies
+        },
+        // Without a timeout a half-open connection can hang for the job's whole
+        // remaining wall clock, printing nothing. A 2 MiB chunk takes ~1s.
+        timeout: 12e4
+      });
+      return;
+    } catch (error2) {
+      const status = axios_default.isAxiosError(error2) ? error2.response?.status : void 0;
+      if (status !== void 0 && status < 500 && status !== 429) {
+        throw error2;
+      }
+      lastError = error2;
+      if (attempt === maxRetries) {
+        break;
+      }
+      const delayMs = Math.min(2e3 * 2 ** (attempt - 1), 3e4);
+      const reason = status ?? (error2 instanceof Error ? error2.message : "network error");
+      core2.warning(
+        `Chunk ${chunkId + 1} failed (${reason}). Retrying in ${delayMs / 1e3}s \u2014 attempt ${attempt + 1}/${maxRetries}.`
+      );
+      await new Promise((resolve7) => setTimeout(resolve7, delayMs));
+    }
+  }
+  throw lastError;
 }
 async function completeUpload(assetId, versionId, cookies) {
   await axios_default.post(

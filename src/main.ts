@@ -103,7 +103,8 @@ export async function run(): Promise<void> {
       cookies,
       beta,
       version,
-      changelog
+      changelog,
+      maxRetries
     )
 
     if (deleteOlderVersions) {
@@ -253,7 +254,9 @@ async function notifyDiscordOnLive(
     const deadline = Date.now() + Math.max(0, timeoutSeconds) * 1000
     let live = false
 
-    core.info('Waiting for the new version to clear escrow (Discord notify) ...')
+    core.info(
+      'Waiting for the new version to clear escrow (Discord notify) ...'
+    )
     for (;;) {
       const versions = await getAssetVersions(assetId, cookies)
       const mine = versions.find(v => v.id === uploadedVersionId)
@@ -285,7 +288,8 @@ async function notifyDiscordOnLive(
     // Discord embed limits: title 256, description 4096, field value 1024.
     const notes = (changelog ?? '').trim()
     let description = notes ? `${status}\n\n${notes}` : status
-    if (description.length > 4000) description = `${description.slice(0, 4000)}\n…`
+    if (description.length > 4000)
+      description = `${description.slice(0, 4000)}\n…`
 
     const serverUrl = process.env.GITHUB_SERVER_URL || 'https://github.com'
     const tag = process.env.GITHUB_REF_NAME || ''
@@ -549,6 +553,7 @@ async function startReupload(
  * @param beta
  * @param version
  * @param changelog
+ * @param maxRetries Attempts per chunk before the upload is abandoned.
  * @returns {Promise<number>} Resolves with the uploaded version ID when the upload is complete.
  * @throws If the upload fails at any stage.
  */
@@ -559,7 +564,8 @@ async function uploadZip(
   cookies: string,
   beta: boolean,
   version: string,
-  changelog: string
+  changelog: string,
+  maxRetries: number
 ): Promise<number> {
   const [assetIdReupload, versionId] = await startReupload(
     zipPath,
@@ -578,24 +584,18 @@ async function uploadZip(
   const chunkCount = Math.ceil(totalSize / chunkSize)
 
   const stream = createReadStream(zipPath, { highWaterMark: chunkSize })
+  const chunkUrl = getUrl('UPLOAD_CHUNK', {
+    id: assetIdReupload,
+    version_id: versionId
+  })
 
   for await (const chunk of stream) {
-    const form = new FormData()
-    form.append('chunk_id', chunkIndex)
-    form.append('chunk', chunk, {
-      filename: 'blob',
-      contentType: 'application/octet-stream'
-    })
-
-    await axios.post(
-      getUrl('UPLOAD_CHUNK', { id: assetIdReupload, version_id: versionId }),
-      form,
-      {
-        headers: {
-          ...form.getHeaders(),
-          Cookie: cookies
-        }
-      }
+    await postChunkWithRetry(
+      chunkUrl,
+      chunk as Buffer,
+      chunkIndex,
+      cookies,
+      maxRetries
     )
 
     core.info(`Uploaded chunk ${chunkIndex + 1}/${chunkCount}`)
@@ -606,6 +606,93 @@ async function uploadZip(
   await completeUpload(assetIdReupload, versionId, cookies)
 
   return versionId
+}
+
+/**
+ * POSTs a single chunk, retrying the portal's transient failures.
+ *
+ * The chunk POST used to be a bare `await`, so one bad response anywhere in the
+ * sequence failed the whole release. That is not hypothetical: tstudio_cveh_police_1
+ * v1.0.20 died on chunk 250 of 305 with a 504 "stream timeout", throwing away four
+ * minutes of a ~610 MiB upload because the portal hiccuped once.
+ *
+ * Retrying a chunk is safe: `chunk_id` is explicit in the body, so re-POSTing the
+ * same id refills that slot rather than appending a duplicate. That also makes a
+ * timed-out-but-actually-delivered chunk harmless to send again.
+ *
+ * Only transient failures are retried. A 4xx other than 429 means the portal
+ * rejected the request itself — an expired session, a wrong version id — and no
+ * number of retries will change its mind.
+ * @param url The UPLOAD_CHUNK endpoint, already resolved for this version.
+ * @param chunk The chunk bytes.
+ * @param chunkId Zero-based index of this chunk.
+ * @param cookies The authentication cookies.
+ * @param maxRetries Attempts to make before giving up.
+ * @throws The last error seen, once the attempts are exhausted.
+ */
+async function postChunkWithRetry(
+  url: string,
+  chunk: Buffer,
+  chunkId: number,
+  cookies: string,
+  maxRetries: number
+): Promise<void> {
+  let lastError: unknown
+
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      // A fresh FormData per attempt: form-data is a stream, and a body that has
+      // already been consumed cannot be replayed.
+      const form = new FormData()
+      form.append('chunk_id', chunkId)
+      form.append('chunk', chunk, {
+        filename: 'blob',
+        contentType: 'application/octet-stream'
+      })
+
+      await axios.post(url, form, {
+        headers: {
+          ...form.getHeaders(),
+          Cookie: cookies
+        },
+        // Without a timeout a half-open connection can hang for the job's whole
+        // remaining wall clock, printing nothing. A 2 MiB chunk takes ~1s.
+        timeout: 120000
+      })
+
+      return
+    } catch (error) {
+      const status = axios.isAxiosError(error)
+        ? error.response?.status
+        : undefined
+
+      if (status !== undefined && status < 500 && status !== 429) {
+        throw error
+      }
+
+      lastError = error
+
+      if (attempt === maxRetries) {
+        break
+      }
+
+      // Exponential, capped at 30s. The outage this exists for lasted about 30
+      // seconds, so a few hundred milliseconds of backoff would just burn the
+      // attempts inside the same bad window — which is exactly what happened.
+      const delayMs = Math.min(2000 * 2 ** (attempt - 1), 30000)
+      const reason =
+        status ?? (error instanceof Error ? error.message : 'network error')
+
+      core.warning(
+        `Chunk ${chunkId + 1} failed (${reason}). Retrying in ${delayMs / 1000}s ` +
+          `— attempt ${attempt + 1}/${maxRetries}.`
+      )
+
+      await new Promise(resolve => setTimeout(resolve, delayMs))
+    }
+  }
+
+  throw lastError
 }
 
 /**

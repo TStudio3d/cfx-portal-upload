@@ -19,7 +19,11 @@ inputs:
     description: 'The asset name to re-upload'
     required: false
   maxRetries:
-    description: 'The maximum number of retries'
+    description:
+      'Attempts for the portal login AND for each individual chunk upload. Chunk
+      retries back off exponentially (2s, 4s, 8s ... capped at 30s), so raising
+      this widens the outage a large upload can survive rather than just
+      retrying faster.'
     required: false
     default: 3
   zipPath:
@@ -45,7 +49,8 @@ inputs:
     description:
       'How many newest versions to keep when deleteOlderVersions is true
       (includes the just-uploaded one). Older versions are pruned once the new
-      upload clears escrow. Defaults to 1 (keep only the newest, the prior behaviour); increase to retain rollback versions.'
+      upload clears escrow. Defaults to 1 (keep only the newest, the prior
+      behaviour); increase to retain rollback versions.'
     required: false
     default: 1
   skipUpload:
