@@ -119349,6 +119349,39 @@ async function waitForLive(assetId, uploadedVersionId, cookies, timeoutSeconds) 
     return false;
   }
 }
+async function changelogButton(webhook) {
+  try {
+    const { data: data2 } = await axios_default.get(
+      webhook,
+      { timeout: 1e4 }
+    );
+    if (!data2 || !data2.application_id) {
+      core2.info(
+        "Discord webhook is not application-owned; go-live message will have no changelog button."
+      );
+      return [];
+    }
+    return [
+      {
+        type: 1,
+        components: [
+          {
+            type: 2,
+            style: 1,
+            label: "Post to #changelog",
+            custom_id: "changelog:post",
+            emoji: { name: "\u{1F4E3}" }
+          }
+        ]
+      }
+    ];
+  } catch (error2) {
+    core2.info(
+      `Could not inspect the Discord webhook (${error2 instanceof Error ? error2.message : String(error2)}); no changelog button.`
+    );
+    return [];
+  }
+}
 async function notifyDiscord(assetId, version, live, webhook, timeoutSeconds, changelog) {
   try {
     const repo = process.env.GITHUB_REPOSITORY || "";
@@ -119380,7 +119413,25 @@ ${notes}` : status;
       timestamp: (/* @__PURE__ */ new Date()).toISOString()
     };
     if (repo && tag) embed.url = `${serverUrl}/${repo}/releases/tag/${tag}`;
-    await axios_default.post(webhook, { embeds: [embed] });
+    const components = live ? await changelogButton(webhook) : [];
+    if (components.length === 0) {
+      await axios_default.post(webhook, { embeds: [embed] });
+    } else {
+      const sep2 = webhook.includes("?") ? "&" : "?";
+      try {
+        await axios_default.post(`${webhook}${sep2}with_components=true`, {
+          embeds: [embed],
+          components
+        });
+      } catch (error2) {
+        if (!axios_default.isAxiosError(error2) || error2.response?.status !== 400)
+          throw error2;
+        core2.warning(
+          "Discord refused the changelog button (400); posting the go-live message without it."
+        );
+        await axios_default.post(webhook, { embeds: [embed] });
+      }
+    }
     core2.info(
       live ? "Discord: notified that the version is live." : "Discord: notified that escrow is still processing."
     );

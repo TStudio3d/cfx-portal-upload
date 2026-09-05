@@ -303,6 +303,54 @@ async function waitForLive(
 }
 
 /**
+ * The action row for the go-live message, or nothing.
+ *
+ * Discord delivers a custom_id button's clicks to the application that owns
+ * the webhook, and refuses such a button on a webhook nobody owns (one created
+ * in the channel settings). GET on the webhook URL answers with the webhook
+ * object; `application_id` is set only for the owned kind. Any doubt — a
+ * failed GET, an unexpected shape — means no button, never a failed post.
+ *
+ * The custom_id is a fixed string on purpose: the bot reads repo, version and
+ * notes from the embed it is attached to, so the button carries no state and
+ * the two sides cannot drift apart over what it means.
+ * @param webhook Discord webhook URL
+ */
+async function changelogButton(webhook: string): Promise<unknown[]> {
+  try {
+    const { data } = await axios.get<{ application_id?: string | null }>(
+      webhook,
+      { timeout: 10_000 }
+    )
+    if (!data || !data.application_id) {
+      core.info(
+        'Discord webhook is not application-owned; go-live message will have no changelog button.'
+      )
+      return []
+    }
+    return [
+      {
+        type: 1,
+        components: [
+          {
+            type: 2,
+            style: 1,
+            label: 'Post to #changelog',
+            custom_id: 'changelog:post',
+            emoji: { name: '📣' }
+          }
+        ]
+      }
+    ]
+  } catch (error) {
+    core.info(
+      `Could not inspect the Discord webhook (${error instanceof Error ? error.message : String(error)}); no changelog button.`
+    )
+    return []
+  }
+}
+
+/**
  * Posts the upload result to a Discord webhook. Best-effort: any failure is
  * logged as a warning and never fails the release.
  * @param assetId
@@ -356,7 +404,31 @@ async function notifyDiscord(
     }
     if (repo && tag) embed.url = `${serverUrl}/${repo}/releases/tag/${tag}`
 
-    await axios.post(webhook, { embeds: [embed] })
+    // A "Post to #changelog" button, so the person who watched the version go
+    // live can hand the notes to customers with one click. Discord only lets an
+    // application-owned webhook carry an action button — a webhook made in the
+    // channel settings gets the embed and nothing else — so ask the webhook what
+    // it is first, and if Discord still refuses, post again without the button
+    // rather than lose the go-live message over a decoration.
+    const components = live ? await changelogButton(webhook) : []
+    if (components.length === 0) {
+      await axios.post(webhook, { embeds: [embed] })
+    } else {
+      const sep = webhook.includes('?') ? '&' : '?'
+      try {
+        await axios.post(`${webhook}${sep}with_components=true`, {
+          embeds: [embed],
+          components
+        })
+      } catch (error) {
+        if (!axios.isAxiosError(error) || error.response?.status !== 400)
+          throw error
+        core.warning(
+          'Discord refused the changelog button (400); posting the go-live message without it.'
+        )
+        await axios.post(webhook, { embeds: [embed] })
+      }
+    }
     core.info(
       live
         ? 'Discord: notified that the version is live.'
